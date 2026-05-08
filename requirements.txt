@@ -1,0 +1,6 @@
+aiofiles==25.1.0
+colorama==0.4.6
+dotenv==0.9.9
+python-dotenv==1.2.1
+schedule==1.2.2
+watchdog==6.0.0
