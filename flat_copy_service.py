@@ -1,19 +1,3 @@
-# service.py
-# ------------------------------------------------------------
-# Production-Grade Async File Transfer Service
-#
-# Changes in this version:
-#   CHANGE #1 — Removed temp/rename pattern. Files are now
-#               copied directly to final destination then
-#               source is deleted. Repeated/duplicate face
-#               crops are fine to overwrite or miss.
-#   CHANGE #2 — Replaced setup_logging() with CustomLogger
-#               from logger.py (date-wise files, colored
-#               console, daily rotation at midnight).
-#   CHANGE #3 — Added .jpeg support alongside .jpg in watchdog
-#               and startup scan.
-# ------------------------------------------------------------
-
 import asyncio
 import shutil
 import os
@@ -48,21 +32,12 @@ def _validate_config():
         raise ValueError("Config errors:\n" + "\n".join(errors))
 
 
-# ============================================================
-# GLOBALS
-# Initialised inside lifespan() after event loop is running.
-# asyncio primitives must not be created at module level.
-# ============================================================
 
 file_queue:       asyncio.Queue = None
 processing_files: set[str]      = set()
 processing_lock:  asyncio.Lock  = None
 
 
-# ============================================================
-# HEALTH CHECK
-# Lightweight — os.path.isdir only, no file write.
-# ============================================================
 
 async def is_drive_accessible() -> bool:
     try:
@@ -87,10 +62,6 @@ async def health_monitor():
         await asyncio.sleep(HEALTH_CHECK_INTERVAL)
 
 
-# ============================================================
-# FILE STABILITY CHECK
-# Polls size via asyncio.to_thread — never blocks event loop.
-# ============================================================
 
 async def wait_for_file_complete(
     filepath: str,
@@ -120,9 +91,6 @@ async def wait_for_file_complete(
     return False
 
 
-# ============================================================
-# QUEUE HELPERS
-# ============================================================
 
 async def enqueue_file(filepath: str):
     """
@@ -153,17 +121,6 @@ async def release_processing(filepath: str):
         processing_files.discard(filepath)
 
 
-# ============================================================
-# WATCHDOG
-# Uses on_created + wait_for_file_complete for cross-OS safety.
-# on_closed is unreliable on Windows/macOS watchdog backends.
-#
-# run_coroutine_threadsafe used (not call_soon_threadsafe +
-# create_task) — correct way to schedule coroutines from a
-# non-async OS thread.
-#
-# CHANGE #3: Checks IMAGE_EXTENSIONS set {.jpg, .jpeg}
-# ============================================================
 
 class ImageFileHandler(FileSystemEventHandler):
 
@@ -184,12 +141,6 @@ class ImageFileHandler(FileSystemEventHandler):
         )
 
 
-# ============================================================
-# STARTUP SCAN
-# Observer starts before this runs — no files missed in gap.
-# CHANGE #3: glob covers both *.jpg and *.jpeg
-# ============================================================
-
 async def scan_existing_files():
     """Enqueue any image files already present on startup."""
     logger.info("STARTUP SCAN | Scanning for existing image files")
@@ -204,21 +155,6 @@ async def scan_existing_files():
 
     logger.info(f"STARTUP SCAN | {count} existing file(s) queued")
 
-
-# ============================================================
-# TRANSFER LOGIC
-#
-# CHANGE #1: Removed temp/rename pattern entirely.
-#   Before: copy → _tmp_<uuid>_<name> → os.replace → delete src
-#   After:  copy → final destination directly → delete src
-#
-# Reason: cropped face images are repeated/similar — missing
-# one or overwriting is acceptable. The extra rename step added
-# latency and complexity that is not needed here.
-#
-# All blocking I/O still runs in asyncio.to_thread so the
-# event loop is never blocked.
-# ============================================================
 
 async def copy_to_shared_drive(filepath: str) -> bool:
     """
@@ -310,9 +246,6 @@ async def copy_to_shared_drive(filepath: str) -> bool:
             attempt = 0
 
 
-# ============================================================
-# WORKERS
-# ============================================================
 
 async def worker(worker_id: int):
     """
@@ -410,9 +343,8 @@ async def lifespan():
     logger.info("SERVICE READY")
     logger.info("=" * 60)
 
-    yield  # service runs here
+    yield  
 
-    # ── GRACEFUL SHUTDOWN ────────────────────────────────────
     logger.info("SHUTDOWN | Stopping service")
 
     observer.stop()
@@ -436,10 +368,6 @@ async def lifespan():
     logger.info("SERVICE STOPPED")
     logger.info("=" * 60)
 
-
-# ============================================================
-# MAIN + ENTRY
-# ============================================================
 
 async def main():
     async with lifespan():
