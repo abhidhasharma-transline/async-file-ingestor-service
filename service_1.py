@@ -263,7 +263,7 @@ async def copy_to_shared_drive(filepath: str) -> bool:
 
         try:
             # CHANGE #1: direct copy to final_dest (no temp)
-            await asyncio.to_thread(shutil.copy2, filepath, final_dest)
+            await asyncio.to_thread(shutil.copyfile, filepath, final_dest)
             logger.debug(f"COPY OK | {filename} → {SHARED_DRIVE}")
 
             # Delete source only after copy confirmed
@@ -400,7 +400,7 @@ async def lifespan():
     # Start watchdog BEFORE scan — no files missed in the gap
     loop     = asyncio.get_event_loop()
     observer = Observer()
-    observer.schedule(ImageFileHandler(loop), WATCH_FOLDER, recursive=False)
+    observer.schedule(ImageFileHandler(loop), WATCH_FOLDER, recursive=True)
     observer.start()
     logger.info(f"WATCHDOG | Monitoring: {WATCH_FOLDER}")
 
