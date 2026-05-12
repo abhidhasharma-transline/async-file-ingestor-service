@@ -1,6 +1,8 @@
 import asyncio
 import shutil
 import os
+import time
+from collections import deque
 from pathlib import Path
 from contextlib import asynccontextmanager
 from watchdog.observers import Observer
@@ -14,9 +16,11 @@ from config import (
     HEALTH_CHECK_INTERVAL,
     QUEUE_MAXSIZE,
     IMAGE_EXTENSIONS,
+    METRICS_WINDOW_SECONDS
 )
 
-logger = get_logger("transfer_service")
+logger = get_logger("transfer")
+metrics_logger = get_logger("metrics")
 
 
 def _validate_config():
@@ -34,7 +38,16 @@ def _validate_config():
 file_queue:       asyncio.Queue = None
 processing_files: set[str]      = set()
 processing_lock:  asyncio.Lock  = None
+metrics_lock:     asyncio.Lock  = None
+transfer_events:  deque[tuple[float, int]] = deque()
 
+total_files_transferred: int = 0
+total_bytes_transferred: int = 0
+current_window_bytes: int = 0
+
+
+def _current_time() -> float:
+    return time.monotonic()
 
 
 async def is_drive_accessible() -> bool:
@@ -77,6 +90,45 @@ async def wait_for_file_complete(
     return False
 
 
+async def record_transfer_metrics(size: int):
+    global total_files_transferred, total_bytes_transferred, current_window_bytes
+
+    async with metrics_lock:
+        transfer_events.append((_current_time(), size))
+        total_files_transferred += 1
+        total_bytes_transferred += size
+        current_window_bytes += size
+
+
+async def metrics_monitor():
+    global current_window_bytes
+    logger.info(
+        f"METRICS MONITOR | Started | Window={METRICS_WINDOW_SECONDS}s"
+    )
+
+    while True:
+        now = _current_time()
+        cutoff = now - METRICS_WINDOW_SECONDS
+
+        async with metrics_lock:
+            while transfer_events and transfer_events[0][0] < cutoff:
+                _, old_size = transfer_events.popleft()
+                current_window_bytes -= old_size
+            current_window_bytes = max(0, current_window_bytes)
+            window_files = len(transfer_events)
+
+        window_secs = max(1.0, METRICS_WINDOW_SECONDS)
+        mb_per_sec = current_window_bytes / 1024 / 1024 / window_secs
+        files_per_sec = window_files / window_secs
+
+        metrics_logger.info(
+            f"METRICS | {files_per_sec:.1f} files/sec | "
+            f"{mb_per_sec:.2f} MB/sec | "
+            f"Queue={file_queue.qsize()} | "
+            f"InFlight={len(processing_files)}"
+        )
+        await asyncio.sleep(1)
+
 
 async def enqueue_file(filepath: str):
     """
@@ -85,16 +137,12 @@ async def enqueue_file(filepath: str):
     """
     async with processing_lock:
         if filepath in processing_files:
-            logger.debug(f"DUPLICATE SKIPPED | {Path(filepath).name}")
+            logger.debug("DUPLICATE SKIPPED | %s", Path(filepath).name)
             return
         processing_files.add(filepath)
 
     try:
         await file_queue.put(filepath)
-        logger.info(
-            f"QUEUED | {Path(filepath).name} | "
-            f"Queue={file_queue.qsize()}"
-        )
     except Exception:
         async with processing_lock:
             processing_files.discard(filepath)
@@ -126,6 +174,18 @@ class ImageFileHandler(FileSystemEventHandler):
             self.loop,
         )
 
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+
+        if Path(event.dest_path).suffix.lower() not in IMAGE_EXTENSIONS:
+            return
+
+        asyncio.run_coroutine_threadsafe(
+            enqueue_file(event.dest_path),
+            self.loop,
+        )
+
 
 async def scan_existing_files():
     """Enqueue all image files already present on startup."""
@@ -134,8 +194,8 @@ async def scan_existing_files():
     count = 0
     for ext in IMAGE_EXTENSIONS:
         # CHANGE #4: rglob walks all subdirectories
-        # Before: Path(WATCH_FOLDER).glob(f"*{ext}")  flat only
-        # After:  Path(WATCH_FOLDER).rglob(f"*{ext}")  recursive
+        # Before: Path(WATCH_FOLDER).glob(f"*{ext}") flat only
+        # After:  Path(WATCH_FOLDER).rglob(f"*{ext}") recursive
         for file in Path(WATCH_FOLDER).rglob(f"*{ext}"):
             if file.is_file():
                 await enqueue_file(str(file))
@@ -165,7 +225,7 @@ async def copy_to_shared_drive(filepath: str) -> bool:
     try:
         relative_path = Path(filepath).relative_to(WATCH_FOLDER)
     except ValueError:
-        # filepath is not under WATCH_FOLDER  use filename only
+        # filepath is not under WATCH_FOLDER use filename only
         logger.warning(
             f"PATH NOT RELATIVE | {filename} | "
             f"falling back to flat destination"
@@ -185,7 +245,7 @@ async def copy_to_shared_drive(filepath: str) -> bool:
             logger.warning(f"SOURCE MISSING | {filename} | skipping")
             return False
 
-        # File stability  wait until fully written to disk
+        # File stability wait until fully written to disk
         stable = await wait_for_file_complete(filepath)
         if not stable:
             logger.warning(f"FILE NOT STABLE | {filename} | retrying")
@@ -206,23 +266,24 @@ async def copy_to_shared_drive(filepath: str) -> bool:
             # CHANGE #4: create destination subfolder if missing
             # e.g. SHARED_DRIVE/2026-03-04/10/ may not exist yet
             await asyncio.to_thread(os.makedirs, dest_dir, exist_ok=True)
-            logger.debug(f"DEST DIR OK | {dest_dir}")
+            logger.debug("DEST DIR OK | %s", dest_dir)
 
-            # CHANGE #5: copyfile (data only)  GVFS compatible
-            # copy2 was rejected by GVFS with Errno 95 because
-            # it tries to set timestamps/permissions on the dest.
+            start_time = _current_time()
             await asyncio.to_thread(shutil.copyfile, filepath, final_dest)
-            logger.debug(
-                f"COPY OK | {filename} � "
-                f"{relative_path}"
-            )
+            elapsed = _current_time() - start_time
 
-            # Delete source only after copy confirmed
+            size = await asyncio.to_thread(os.path.getsize, filepath)
+            logger.debug("COPY OK | %s → %s", filename, relative_path)
+
+            # Record metrics before deleting the source file.
+            await record_transfer_metrics(size)
+
             await asyncio.to_thread(os.remove, filepath)
-            logger.debug(f"SOURCE DELETED | {filepath}")
+            logger.debug("SOURCE DELETED | %s", filepath)
 
             logger.info(
                 f"TRANSFER SUCCESS | {relative_path} | "
+                f"{size} bytes | {elapsed:.3f}s | "
                 f"attempts={attempt}"
             )
             return True
@@ -252,7 +313,7 @@ async def copy_to_shared_drive(filepath: str) -> bool:
             )
             await asyncio.sleep(wait)
 
-        # Retry cycle exhausted  2-minute cooldown then reset
+        # Retry cycle exhausted 2-minute cooldown then reset
         if attempt % MAX_RETRIES == 0:
             logger.warning(
                 f"RETRY CYCLE EXHAUSTED | {filename} | "
@@ -271,10 +332,10 @@ async def worker(worker_id: int):
 
         try:
             if filepath is None:
-                logger.info(f"WORKER {worker_id} | Shutdown signal  exiting")
+                logger.info(f"WORKER {worker_id} | Shutdown signal exiting")
                 return
 
-            logger.info(
+            logger.debug(
                 f"WORKER {worker_id} | "
                 f"Processing={Path(filepath).name} | "
                 f"Queue={file_queue.qsize()}"
@@ -291,11 +352,9 @@ async def worker(worker_id: int):
 
 @asynccontextmanager
 async def lifespan():
-    global file_queue, processing_lock, processing_files
+    global file_queue, processing_lock, processing_files, metrics_lock
 
-    logger.info("=" * 60)
     logger.info("FILE TRANSFER SERVICE | STARTING")
-    logger.info("=" * 60)
     logger.info(f"Watch Folder      : {WATCH_FOLDER}")
     logger.info(f"Shared Drive      : {SHARED_DRIVE}")
     logger.info(f"Workers           : {MAX_WORKERS}")
@@ -304,7 +363,6 @@ async def lifespan():
     logger.info(f"Queue max         : {QUEUE_MAXSIZE}")
     logger.info(f"Image extensions  : {IMAGE_EXTENSIONS}")
     logger.info(f"Recursive watch   : Yes")
-    logger.info("=" * 60)
 
     _validate_config()
 
@@ -313,13 +371,14 @@ async def lifespan():
     # Initialise async primitives inside running event loop
     file_queue       = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
     processing_lock  = asyncio.Lock()
+    metrics_lock     = asyncio.Lock()
     processing_files = set()
 
     # Initial drive check
     if await is_drive_accessible():
         logger.info("STARTUP | Shared drive reachable")
     else:
-        logger.warning("STARTUP | Shared drive unreachable  will retry")
+        logger.warning("STARTUP | Shared drive unreachable will retry")
 
     # Start workers
     worker_tasks = [
@@ -330,10 +389,11 @@ async def lifespan():
 
     # Start health monitor
     health_task = asyncio.create_task(health_monitor())
+    metrics_task = asyncio.create_task(metrics_monitor())
 
-    # CHANGE #4: recursive=True  watches all nested subfolders
-    # Before: recursive=False  only top-level WATCH_FOLDER
-    # After:  recursive=True   all date/hour subfolders watched
+    # CHANGE #4: recursive=True watches all nested subfolders
+    # Before: recursive=False only top-level WATCH_FOLDER
+    # After:  recursive=True all date/hour subfolders watched
     loop     = asyncio.get_event_loop()
     observer = Observer()
     observer.schedule(
@@ -348,8 +408,7 @@ async def lifespan():
     await scan_existing_files()
 
     logger.info("SERVICE READY")
-    logger.info("=" * 60)
-
+    
     yield  
 
     logger.info("SHUTDOWN | Stopping service")
@@ -372,8 +431,14 @@ async def lifespan():
         pass
     logger.info("SHUTDOWN | Health monitor stopped")
 
+    metrics_task.cancel()
+    try:
+        await metrics_task
+    except asyncio.CancelledError:
+        pass
+    logger.info("SHUTDOWN | Metrics monitor stopped")
+
     logger.info("SERVICE STOPPED")
-    logger.info("=" * 60)
 
 
 
@@ -381,7 +446,7 @@ async def main():
     async with lifespan():
         try:
             while True:
-                await asyncio.sleep(1)
+                await asyncio.sleep(5)
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass
 
