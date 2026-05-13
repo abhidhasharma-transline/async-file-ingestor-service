@@ -271,7 +271,11 @@ async def copy_to_shared_drive(filepath: str) -> bool:
             start_time = _current_time()
             await asyncio.to_thread(shutil.copyfile, filepath, final_dest)
             elapsed = _current_time() - start_time
-
+            logger.info(
+                f"COPY SPEED | {filename} | "
+                f"{size / 1024:.1f} KB | "
+                f"{elapsed:.3f}s"
+            )
             size = await asyncio.to_thread(os.path.getsize, filepath)
             logger.debug("COPY OK | %s → %s", filename, relative_path)
 

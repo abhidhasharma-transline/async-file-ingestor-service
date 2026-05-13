@@ -8,9 +8,8 @@ init(autoreset=True)
 
 LOG_DIR = Path("logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-MAX_LOG_BYTES = 10 * 1024 * 1024
-BACKUP_COUNT = 5
-
+MAX_LOG_BYTES = 10 * 1024 * 1024  
+BACKUP_COUNT = 15  
 
 def _create_rotating_handler(filename: str, level: int, formatter: logging.Formatter):
     path = LOG_DIR / filename
@@ -54,13 +53,28 @@ class CustomLogger:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
         console_formatter = ColoredFormatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
+            "%(asctime)s - %(levelname)s - %(message)s", 
+            datefmt="%H:%M:%S",
         )
 
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.WARNING)
+        console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(console_formatter)
+        
+        class ConsoleFilter(logging.Filter):
+            def filter(self, record):
+                # Hide these from console
+                hidden_messages = [
+                    "COPY OK", "COPY ERROR", "BATCHER", 
+                    "METRICS", "DELETED", "Batch of", "WORKER"
+                ]
+                msg = record.getMessage()
+                for hidden in hidden_messages:
+                    if hidden in msg:
+                        return False
+                return True
+        
+        console_handler.addFilter(ConsoleFilter())
         self.logger.addHandler(console_handler)
 
         if module_name == "metrics":
